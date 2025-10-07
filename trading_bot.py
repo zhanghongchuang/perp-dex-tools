@@ -73,6 +73,7 @@ class TradingBot:
 
         # Trading state
         self.active_close_orders = []
+        self.close_orders_timestamps = {}  # 记录平仓单的创建时间 {order_id: timestamp}
         self.last_close_orders = 0
         self.last_open_order_time = 0
         self.last_log_time = 0
@@ -118,13 +119,15 @@ class TradingBot:
                 if status == 'FILLED':
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
+                        self.exchange_client.on_open_filled(self.config.contract_id, filled_size, side)
                         # Ensure thread-safe interaction with asyncio event loop
                         if self.loop is not None:
                             self.loop.call_soon_threadsafe(self.order_filled_event.set)
                         else:
                             # Fallback (should not happen after run() starts)
                             self.order_filled_event.set()
-
+                    else:
+                        self.exchange_client.on_close_filled(self.config.contract_id, filled_size, side)
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
                     self.logger.log_transaction(order_id, side, message.get('size'), message.get('price'), status)
@@ -138,7 +141,9 @@ class TradingBot:
 
                         if self.order_filled_amount > 0:
                             self.logger.log_transaction(order_id, side, self.order_filled_amount, message.get('price'), status)
-
+                    else:
+                        if filled_size > 0:
+                            self.exchange_client.on_close_filled(self.config.contract_id, filled_size, side)
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
                 elif status == "PARTIALLY_FILLED":
@@ -239,7 +244,6 @@ class TradingBot:
                     close_price = filled_price * (1 + self.config.take_profit/100)
                 else:
                     close_price = filled_price * (1 - self.config.take_profit/100)
-
                 close_order_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
                     self.config.quantity,
@@ -252,6 +256,10 @@ class TradingBot:
                 if not close_order_result.success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
                     raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
+                else:
+                    # 记录平仓单创建时间
+                    if close_order_result.order_id:
+                        self.close_orders_timestamps[close_order_result.order_id] = time.time()
 
                 return True
 
@@ -349,6 +357,10 @@ class TradingBot:
                 self.last_open_order_time = time.time()
                 if not close_order_result.success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
+                else:
+                    # 记录平仓单创建时间
+                    if close_order_result.order_id:
+                        self.close_orders_timestamps[close_order_result.order_id] = time.time()
 
             return True
 
@@ -469,6 +481,74 @@ class TradingBot:
 
         return stop_trading, pause_trading
 
+    async def _check_and_refresh_timeout_close_orders(self):
+        """检查并刷新超时的平仓单（超过10分钟未成交）"""
+        timeout_seconds = 10 * 60  # 10分钟
+        current_time = time.time()
+        orders_to_refresh = []
+        
+        # 检查哪些平仓单超时了
+        for order in self.active_close_orders:
+            order_id = order.get('id')
+            if order_id in self.close_orders_timestamps:
+                order_time = self.close_orders_timestamps[order_id]
+                if current_time - order_time > timeout_seconds:
+                    orders_to_refresh.append(order)
+        
+        # 处理超时的订单
+        for order in orders_to_refresh:
+            order_id = order.get('id')
+            order_size = order.get('size')
+            
+            try:
+                self.logger.log(f"[CLOSE TIMEOUT] Order {order_id} timeout after 10 minutes, refreshing...", "INFO")
+                
+                # 1. 取消超时的订单
+                cancel_result = await self.exchange_client.cancel_order(order_id)
+                if cancel_result.success:
+                    self.logger.log(f"[CLOSE TIMEOUT] Successfully canceled timeout order {order_id}", "INFO")
+                    
+                    # 2. 获取当前最佳价格
+                    best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                        self.logger.log("[CLOSE TIMEOUT] Invalid bid/ask prices, skipping refresh", "ERROR")
+                        continue
+                    
+                    # 3. 计算新的平仓价格（更接近当前市场价格）
+                    close_side = self.config.close_order_side
+                    if close_side == 'sell':
+                        # 卖单：基于当前买价计算，稍微提高止盈要求但更接近市场
+                        new_close_price = best_bid * (1 + self.config.take_profit/200)  # 减半止盈要求使更容易成交
+                    else:
+                        # 买单：基于当前卖价计算，稍微提高止盈要求但更接近市场  
+                        new_close_price = best_ask * (1 - self.config.take_profit/200)  # 减半止盈要求使更容易成交
+                    
+                    # 4. 下新的平仓单
+                    new_close_result = await self.exchange_client.place_close_order(
+                        self.config.contract_id,
+                        order_size,
+                        new_close_price,
+                        close_side
+                    )
+                    
+                    if new_close_result.success:
+                        self.logger.log(f"[CLOSE TIMEOUT] Successfully placed new close order {new_close_result.order_id} "
+                                      f"at price {new_close_price}", "INFO")
+                        
+                        # 5. 更新时间戳记录
+                        if order_id in self.close_orders_timestamps:
+                            del self.close_orders_timestamps[order_id]
+                        if new_close_result.order_id:
+                            self.close_orders_timestamps[new_close_result.order_id] = current_time
+                    else:
+                        self.logger.log(f"[CLOSE TIMEOUT] Failed to place new close order: {new_close_result.error_message}", "ERROR")
+                else:
+                    self.logger.log(f"[CLOSE TIMEOUT] Failed to cancel timeout order {order_id}: {cancel_result.error_message}", "ERROR")
+                    
+            except Exception as e:
+                self.logger.log(f"[CLOSE TIMEOUT] Error refreshing timeout order {order_id}: {e}", "ERROR")
+                self.logger.log(f"[CLOSE TIMEOUT] Traceback: {traceback.format_exc()}", "ERROR")
+
     async def send_notification(self, message: str):
         lark_token = os.getenv("LARK_TOKEN")
         if lark_token:
@@ -517,6 +597,7 @@ class TradingBot:
 
                 # Filter close orders
                 self.active_close_orders = []
+                active_close_order_ids = set()
                 for order in active_orders:
                     if order.side == self.config.close_order_side:
                         self.active_close_orders.append({
@@ -524,9 +605,20 @@ class TradingBot:
                             'price': order.price,
                             'size': order.size
                         })
+                        active_close_order_ids.add(order.order_id)
+                        if order.order_id not in self.close_orders_timestamps:
+                            self.close_orders_timestamps.setdefault(order.order_id, time.time())
+                
+                # 清理已不存在的订单时间戳
+                expired_order_ids = set(self.close_orders_timestamps.keys()) - active_close_order_ids
+                for expired_id in expired_order_ids:
+                    del self.close_orders_timestamps[expired_id]
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()
+
+                # Check and refresh timeout close orders
+                # await self._check_and_refresh_timeout_close_orders()
 
                 stop_trading, pause_trading = await self._check_price_condition()
                 if stop_trading:

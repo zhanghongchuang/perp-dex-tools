@@ -93,6 +93,14 @@ class BaseExchangeClient(ABC):
         """Place an open order."""
         pass
 
+    def on_close_filled(self, contract_id: str, filled_size: Decimal = Decimal(0), side: str = ''):
+        """Callback when a close order is filled."""
+        pass
+
+    def on_open_filled(self, contract_id: str, filled_size: Decimal = Decimal(0), side: str = ''):
+        """Callback when an open order is filled."""
+        pass
+
     @abstractmethod
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order."""

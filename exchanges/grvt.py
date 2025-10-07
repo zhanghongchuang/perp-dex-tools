@@ -10,6 +10,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from pysdk.grvt_ccxt import GrvtCcxt
 from pysdk.grvt_ccxt_ws import GrvtCcxtWS
 from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+from bpx.account import Account
+from bpx.constants.enums import OrderTypeEnum, TimeInForceEnum
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
 from helpers.logger import TradingLogger
@@ -27,6 +29,14 @@ class GrvtClient(BaseExchangeClient):
         self.private_key = os.getenv('GRVT_PRIVATE_KEY')
         self.api_key = os.getenv('GRVT_API_KEY')
         self.environment = os.getenv('GRVT_ENVIRONMENT', 'prod')
+        
+        self.bp_public_key = os.getenv('BACKPACK_PUBLIC_KEY')
+        self.bp_secret_key = os.getenv('BACKPACK_SECRET_KEY')
+        self.bp_contract_id = self.config.ticker + '_USDC_PERP'
+        self.bp_account_client = Account(
+            public_key=self.bp_public_key,
+            secret_key=self.bp_secret_key
+        )
 
         if not self.trading_account_id or not self.private_key or not self.api_key:
             raise ValueError(
@@ -350,6 +360,57 @@ class GrvtClient(BaseExchangeClient):
                 raise Exception("[OPEN] Order not processed after 10 seconds")
             else:
                 raise Exception(f"[OPEN] Unexpected order status: {order_status}")
+
+    def on_close_filled(self, contract_id: str, quantity: Decimal = Decimal(0), side: str = ''):
+        """Callback when a close order is filled."""
+        self.logger.log(f"[CLOSE FILLED] Close order filled for {quantity} units", "INFO")
+        # 如果完成的订单是买入，那么在bp的对冲单就需要是卖出类型
+        if side.lower() == 'buy':
+            side = 'Ask'
+        else:
+            side = 'Bid'
+        order_result = self.bp_account_client.execute_order(
+                symbol=self.bp_contract_id,
+                side=side,
+                order_type=OrderTypeEnum.MARKET,
+                quantity=str(quantity)
+            )
+        if not order_result:
+            self.logger.log(f"[CLOSE FILLED] Error executing close order on Backpack", "ERROR")
+            raise
+    
+        if 'code' in order_result:
+            message = order_result.get('message', 'Unknown error')
+            self.logger.log(f"[CLOSE FILLED] Error placing order: {message}", "ERROR")
+            raise
+        
+        if 'id' not in order_result:
+            self.logger.log(f"[OPEN FILLED] No order ID returned from Backpack", "ERROR")
+            raise
+
+    def on_open_filled(self, contract_id: str, quantity: Decimal = Decimal(0), side: str = ''):
+        """Callback when an open order is filled."""
+        self.logger.log(f"[OPEN FILLED] Open order filled for {quantity} units", "INFO")
+        if side.lower() == 'buy':
+            side = 'Ask'
+        else:
+            side = 'Bid'
+        order_result = self.bp_account_client.execute_order(
+                symbol=self.bp_contract_id,
+                side=side,
+                order_type=OrderTypeEnum.MARKET,
+                quantity=str(quantity)
+            )
+        if not order_result:
+            self.logger.log(f"[OPEN FILLED] Error executing open order on Backpack", "ERROR")
+            raise
+        if 'code' in order_result:
+            message = order_result.get('message', 'Unknown error')
+            self.logger.log(f"[OPEN FILLED] Error placing order: {message}", "ERROR")
+            raise
+        if 'id' not in order_result:
+            self.logger.log(f"[OPEN FILLED] No order ID returned from Backpack", "ERROR")
+            raise
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with GRVT."""
