@@ -482,8 +482,8 @@ class TradingBot:
         return stop_trading, pause_trading
 
     async def _check_and_refresh_timeout_close_orders(self):
-        """检查并刷新超时的平仓单（超过10分钟未成交）"""
-        timeout_seconds = 10 * 60  # 10分钟
+        """检查并刷新超时的平仓单（超过30分钟未成交）"""
+        timeout_seconds = 30 * 60  # 30分钟
         current_time = time.time()
         orders_to_refresh = []
         
@@ -618,7 +618,7 @@ class TradingBot:
                 mismatch_detected = await self._log_status_periodically()
 
                 # Check and refresh timeout close orders
-                # await self._check_and_refresh_timeout_close_orders()
+                await self._check_and_refresh_timeout_close_orders()
 
                 stop_trading, pause_trading = await self._check_price_condition()
                 if stop_trading:
